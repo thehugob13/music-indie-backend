@@ -9,6 +9,11 @@ import httpx
 from fastapi import FastAPI, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from typing import Literal
+try:
+    from .archive_source import search_archive, archive_metadata, process_archive, SourceError, decode_reference
+except ImportError:
+    from archive_source import search_archive, archive_metadata, process_archive, SourceError, decode_reference
 
 @dataclass
 class Settings:
@@ -18,7 +23,7 @@ class Settings:
     retention_seconds: int = 86400
 
 class JobInput(BaseModel):
-    video_id: str = Field(pattern=r"^[A-Za-z0-9_-]{11}$")
+    video_id: str = Field(pattern=r"^(?:[A-Za-z0-9_-]{11}|ia:[A-Za-z0-9_-]{1,1000})$")
 
 class Database:
     def __init__(self, root: Path):
@@ -68,6 +73,7 @@ async def youtube(settings: Settings, resource: str, params: dict):
     return response.json()
 
 async def metadata(settings:Settings, ids:list[str]):
+    if len(ids)==1 and ids[0].startswith("ia:"): return await archive_metadata(ids[0])
     data=await youtube(settings,"videos",{"part":"snippet,status,contentDetails","id":",".join(ids)})
     results=[]
     for item in data.get("items",[]):
@@ -84,6 +90,7 @@ async def search(settings:Settings, query:str):
     return await metadata(settings,ids) if ids else []
 
 def process_youtube(db:Database, job:dict, folder:Path):
+    if job["video"].startswith("ia:"): return process_archive(db,job,folder)
     if shutil.disk_usage(db.root).free < 512*1024*1024: raise ValueError("Insufficient disk space")
     db.state(job["id"],"downloading")
     subprocess.run(["yt-dlp","--js-runtimes","node","--no-playlist","--no-progress","--no-warnings","--socket-timeout","15","--retries","2","--max-filesize","100M","--match-filter","duration <= 1200 & !is_live","-f","bestaudio/best","-o",str(folder/"source.%(ext)s"),"--","https://www.youtube.com/watch?v="+job["video"]],capture_output=True,timeout=240,check=True)
@@ -91,6 +98,25 @@ def process_youtube(db:Database, job:dict, folder:Path):
     if len(candidates)!=1: raise ValueError("No valid source")
     db.state(job["id"],"converting"); convert_file(candidates[0],folder/"audio.mp3")
     for p in candidates: p.unlink(missing_ok=True)
+
+def conversion_error(error: Exception) -> str:
+    if isinstance(error,SourceError): return str(error)
+    if isinstance(error, FileNotFoundError):
+        name=Path(error.filename or "ferramenta de mídia").name
+        return "Ferramenta indisponível no servidor: " + (name if name in {"yt-dlp","ffmpeg","ffprobe","node"} else "processador de mídia") + "."
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "A fonte demorou demais para fornecer o áudio. A tarefa foi interrompida."
+    if isinstance(error, subprocess.CalledProcessError):
+        raw=error.stderr or b""
+        text=(raw.decode("utf-8","replace") if isinstance(raw,bytes) else str(raw)).lower()
+        if "not a bot" in text or "sign in to confirm" in text:
+            return "O YouTube exigiu verificação interativa e não forneceu o áudio a este servidor. Esta fonte não pode ser processada aqui."
+        if "http error 403" in text or "403 forbidden" in text:
+            return "A fonte recusou acesso ao áudio (HTTP 403). Não foi possível iniciar a conversão."
+        if "javascript runtime" in text or "js runtime" in text:
+            return "O extrator não conseguiu usar o runtime JavaScript do servidor. Confira a instalação do Node."
+        return "O processador de mídia não recebeu um arquivo utilizável da fonte (código " + str(error.returncode) + ")."
+    return "A fonte não permitiu concluir a conversão. Tente novamente mais tarde."
 
 def create_app(settings:Settings|None=None):
     settings=settings or Settings();db=Database(settings.root);limit=Limit()
@@ -115,15 +141,15 @@ def create_app(settings:Settings|None=None):
                     if not videos or not videos[0]["download_allowed"]: raise ValueError("Authorization changed")
                     await asyncio.to_thread(app.state.processor,db,job,folder)
                     db.state(job["id"],"ready")
-                except Exception:
+                except Exception as error:
                     shutil.rmtree(folder,ignore_errors=True)
-                    db.state(job["id"],"failed","A fonte não permitiu concluir a conversão. Tente novamente mais tarde.")
+                    db.state(job["id"],"failed",conversion_error(error))
         task=asyncio.create_task(worker())
         yield
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError): await task
     app=FastAPI(title="Music Indie media backend",version="0.2.0",lifespan=lifespan)
-    app.state.search_provider=search;app.state.metadata_provider=metadata;app.state.processor=process_youtube;app.state.db=db
+    app.state.search_provider=search;app.state.archive_search_provider=search_archive;app.state.metadata_provider=metadata;app.state.processor=process_youtube;app.state.db=db
     def owner(authorization:str=Header(default="")):
         token=authorization.removeprefix("Bearer ")
         if not authorization.startswith("Bearer ") or not re.fullmatch(r"[A-Za-z0-9_-]{40,100}",token): raise HTTPException(401,"Conecte novamente ao backend.")
@@ -134,9 +160,11 @@ def create_app(settings:Settings|None=None):
     def get_job(job_id,who):
         with db.connect() as c: row=c.execute("SELECT * FROM jobs WHERE id=? AND owner=?",(job_id,who)).fetchone()
         if not row: raise HTTPException(404,"Conversão não encontrada.")
-        return dict(row)
+        result=dict(row)
+        result["source"]=("https://archive.org/details/"+decode_reference(result["video"])[0]) if result["video"].startswith("ia:") else "https://www.youtube.com/watch?v="+result["video"]
+        return result
     @app.get("/health")
-    def health(): return {"status":"ok","search_configured":bool(settings.api_key)}
+    def health(): return {"status":"ok","search_configured":bool(settings.api_key),"media_provider":"free","free_catalog_enabled":True}
     @app.post("/sessions",status_code=201)
     def session(request:Request):
         limit.check("session:"+(request.client.host if request.client else "unknown"),20,3600)
@@ -144,15 +172,17 @@ def create_app(settings:Settings|None=None):
         with db.connect() as c: c.execute("INSERT INTO sessions VALUES (?,?)",(hashlib.sha256(token.encode()).hexdigest(),time.time()))
         return {"token":token,"expires_in":7*86400}
     @app.get("/search")
-    async def find(q:str,who=Depends(owner)):
+    async def find(q:str,source:Literal["youtube","archive"]="youtube",who=Depends(owner)):
         q=q.strip()
         if not 2<=len(q)<=120: raise HTTPException(422,"Busque por um nome entre 2 e 120 caracteres.")
         limit.check("search:"+who,5)
-        return {"items":await app.state.search_provider(settings,q)}
+        try: return {"items":await (app.state.archive_search_provider(settings,q) if source=="archive" else app.state.search_provider(settings,q))}
+        except SourceError as error: raise HTTPException(502,str(error)) from None
     @app.post("/jobs",status_code=202)
     async def add(body:JobInput,who=Depends(owner)):
         limit.check("job:"+who,5)
-        videos=await app.state.metadata_provider(settings,[body.video_id])
+        try: videos=await app.state.metadata_provider(settings,[body.video_id])
+        except SourceError as error: raise HTTPException(400,str(error)) from None
         if not videos: raise HTTPException(404,"Vídeo indisponível.")
         v=videos[0]
         if not v["download_allowed"]: raise HTTPException(403,"Esta gravação não tem autorização de download cadastrada ou excede os limites.")

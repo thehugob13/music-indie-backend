@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg gosu ca-
 WORKDIR /app
 COPY requirements.txt .
 RUN --mount=type=secret,id=proxy_ca if [ -f /run/secrets/proxy_ca ]; then PIP_CERT=/run/secrets/proxy_ca pip install --no-cache-dir -r requirements.txt; else pip install --no-cache-dir -r requirements.txt; fi
-COPY app.py entrypoint.sh ./
+COPY app.py archive_source.py entrypoint.sh ./
 RUN chmod 755 /app/entrypoint.sh
 EXPOSE 8080
 ENTRYPOINT ["/app/entrypoint.sh"]
